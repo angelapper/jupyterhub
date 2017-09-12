@@ -1,10 +1,14 @@
+from binascii import hexlify
 import json
+import os
 from queue import Queue
 import sys
 from threading import Thread
 import time
 from unittest import mock
+from urllib.parse import urlparse
 
+import pytest
 from pytest import raises
 import requests
 import requests_mock
@@ -15,6 +19,9 @@ from tornado.web import RequestHandler, Application, authenticated, HTTPError
 
 from ..services.auth import _ExpiringDict, HubAuth, HubAuthenticated
 from ..utils import url_path_join
+from .mocking import public_url, public_host
+from .test_api import add_user
+from .utils import async_requests
 
 # mock for sending monotonic counter way into the future
 monotonic_future = mock.patch('time.monotonic', lambda : sys.maxsize)
@@ -100,7 +107,8 @@ def test_hub_auth():
 def test_hub_authenticated(request):
     auth = HubAuth(cookie_name='jubal')
     mock_model = {
-        'name': 'jubalearly'
+        'name': 'jubalearly',
+        'groups': ['lions'],
     }
     cookie_url = url_path_join(auth.api_url, "authorizations/cookie", auth.cookie_name)
     good_url = url_path_join(cookie_url, "early")
@@ -189,8 +197,163 @@ def test_hub_authenticated(request):
             cookies={'jubal': 'early'},
             allow_redirects=False,
         )
+        assert r.status_code == 403
+        
+        # pass group whitelist
+        TestHandler.hub_groups = {'lions'}
+        r = requests.get('http://127.0.0.1:%i' % port,
+            cookies={'jubal': 'early'},
+            allow_redirects=False,
+        )
         r.raise_for_status()
-        assert r.status_code == 302
-        assert auth.login_url in r.headers['Location']
+        assert r.status_code == 200
 
+        # no pass group whitelist
+        TestHandler.hub_groups = {'tigers'}
+        r = requests.get('http://127.0.0.1:%i' % port,
+            cookies={'jubal': 'early'},
+            allow_redirects=False,
+        )
+        assert r.status_code == 403
+
+
+@pytest.mark.gen_test
+def test_hubauth_cookie(app, mockservice_url):
+    """Test HubAuthenticated service with user cookies"""
+    cookies = yield app.login_user('badger')
+    r = yield async_requests.get(public_url(app, mockservice_url) + '/whoami/', cookies=cookies)
+    r.raise_for_status()
+    print(r.text)
+    reply = r.json()
+    sub_reply = { key: reply.get(key, 'missing') for key in ['name', 'admin']}
+    assert sub_reply == {
+        'name': 'badger',
+        'admin': False,
+    }
+
+
+@pytest.mark.gen_test
+def test_hubauth_token(app, mockservice_url):
+    """Test HubAuthenticated service with user API tokens"""
+    u = add_user(app.db, name='river')
+    token = u.new_api_token()
+    app.db.commit()
+
+    # token in Authorization header
+    r = yield async_requests.get(public_url(app, mockservice_url) + '/whoami/',
+        headers={
+            'Authorization': 'token %s' % token,
+        })
+    reply = r.json()
+    sub_reply = { key: reply.get(key, 'missing') for key in ['name', 'admin']}
+    assert sub_reply == {
+        'name': 'river',
+        'admin': False,
+    }
+
+    # token in ?token parameter
+    r = yield async_requests.get(public_url(app, mockservice_url) + '/whoami/?token=%s' % token)
+    r.raise_for_status()
+    reply = r.json()
+    sub_reply = { key: reply.get(key, 'missing') for key in ['name', 'admin']}
+    assert sub_reply == {
+        'name': 'river',
+        'admin': False,
+    }
+
+    r = yield async_requests.get(public_url(app, mockservice_url) + '/whoami/?token=no-such-token',
+        allow_redirects=False,
+    )
+    assert r.status_code == 302
+    assert 'Location' in r.headers
+    location = r.headers['Location']
+    path = urlparse(location).path
+    assert path.endswith('/hub/login')
+
+
+@pytest.mark.gen_test
+def test_hubauth_service_token(app, mockservice_url):
+    """Test HubAuthenticated service with service API tokens"""
+    
+    token = hexlify(os.urandom(5)).decode('utf8')
+    name = 'test-api-service'
+    app.service_tokens[token] = name
+    yield app.init_api_tokens()
+
+    # token in Authorization header
+    r = yield async_requests.get(public_url(app, mockservice_url) + '/whoami/',
+        headers={
+            'Authorization': 'token %s' % token,
+        })
+    r.raise_for_status()
+    reply = r.json()
+    assert reply == {
+        'kind': 'service',
+        'name': name,
+        'admin': False,
+    }
+    assert not r.cookies
+
+    # token in ?token parameter
+    r = yield async_requests.get(public_url(app, mockservice_url) + '/whoami/?token=%s' % token)
+    r.raise_for_status()
+    reply = r.json()
+    assert reply == {
+        'kind': 'service',
+        'name': name,
+        'admin': False,
+    }
+
+    r = yield async_requests.get(public_url(app, mockservice_url) + '/whoami/?token=no-such-token',
+        allow_redirects=False,
+    )
+    assert r.status_code == 302
+    assert 'Location' in r.headers
+    location = r.headers['Location']
+    path = urlparse(location).path
+    assert path.endswith('/hub/login')
+
+
+@pytest.mark.gen_test
+def test_oauth_service(app, mockservice_url):
+    url = url_path_join(public_url(app, mockservice_url) + 'owhoami/')
+    # first request is only going to set login cookie
+    # FIXME: redirect to originating URL (OAuth loses this info)
+    s = requests.Session()
+    name = 'link'
+    s.cookies = yield app.login_user(name)
+    # run session.get in async_requests thread
+    s_get = lambda *args, **kwargs: async_requests.executor.submit(s.get, *args, **kwargs)
+    r = yield s_get(url)
+    r.raise_for_status()
+    # second request should be authenticated
+    r = yield s_get(url, allow_redirects=False)
+    r.raise_for_status()
+    assert r.status_code == 200
+    reply = r.json()
+    sub_reply = { key:reply.get(key, 'missing') for key in ('kind', 'name') }
+    assert sub_reply == {
+        'name': 'link',
+        'kind': 'user',
+    }
+
+    # token-authenticated request to HubOAuth
+    token = app.users[name].new_api_token()
+    # token in ?token parameter
+    r = yield async_requests.get(public_url(app, mockservice_url) + 'owhoami/?token=%s' % token)
+    r.raise_for_status()
+    reply = r.json()
+    assert reply['name'] == name
+
+    # verify that ?token= requests set a cookie
+    assert len(r.cookies) != 0
+    # ensure cookie works in future requests
+    r = yield async_requests.get(
+        public_url(app, mockservice_url) + 'owhoami/',
+        cookies=r.cookies,
+        allow_redirects=False,
+    )
+    r.raise_for_status()
+    reply = r.json()
+    assert reply['name'] == name
 

@@ -13,6 +13,14 @@ from ..utils import url_path_join
 
 class APIHandler(BaseHandler):
 
+    @property
+    def content_security_policy(self):
+        return '; '.join([super().content_security_policy, "default-src 'none'"])
+
+    def set_default_headers(self):
+        self.set_header('Content-Type', 'application/json')
+        super().set_default_headers()
+
     def check_referer(self):
         """Check Origin for cross-site API requests.
         
@@ -32,7 +40,7 @@ class APIHandler(BaseHandler):
             self.log.warning("Blocking API request with no referer")
             return False
         
-        host_path = url_path_join(host, self.hub.server.base_url)
+        host_path = url_path_join(host, self.hub.base_url)
         referer_path = referer.split('://', 1)[-1]
         if not (referer_path + '/').startswith(host_path):
             self.log.warning("Blocking Cross Origin API request.  Referer: %s, Host: %s",
@@ -80,7 +88,6 @@ class APIHandler(BaseHandler):
             reason = getattr(exception, 'reason', '')
             if reason:
                 status_message = reason
-        self.set_header('Content-Type', 'application/json')
         self.write(json.dumps({
             'status': status_code,
             'message': message or status_message,
@@ -89,6 +96,7 @@ class APIHandler(BaseHandler):
     def user_model(self, user):
         """Get the JSON model for a User object"""
         model = {
+            'kind': 'user',
             'name': user.name,
             'admin': user.admin,
             'groups': [ g.name for g in user.groups ],
@@ -96,17 +104,33 @@ class APIHandler(BaseHandler):
             'pending': None,
             'last_activity': user.last_activity.isoformat(),
         }
-        if user.spawn_pending:
-            model['pending'] = 'spawn'
-        elif user.stop_pending:
-            model['pending'] = 'stop'
+        model['pending'] = user.spawners[''].pending or None
+
+        if self.allow_named_servers:
+            servers = model['servers'] = {}
+            for name, spawner in user.spawners.items():
+                if spawner.ready:
+                    servers[name] = s = {'name': name}
+                    if spawner.pending:
+                        s['pending'] = spawner.pending
+                    if spawner.server:
+                        s['url'] = user.url + name + '/'
         return model
 
     def group_model(self, group):
         """Get the JSON model for a Group object"""
         return {
+            'kind': 'group',
             'name': group.name,
-            'users': [ u.name for u in group.users ]
+            'users': [ u.name for u in group.users ],
+        }
+
+    def service_model(self, service):
+        """Get the JSON model for a Service object"""
+        return {
+            'kind': 'service',
+            'name': service.name,
+            'admin': service.admin,
         }
 
     _user_model_types = {
@@ -140,19 +164,19 @@ class APIHandler(BaseHandler):
 
     def _check_user_model(self, model):
         """Check a request-provided user model from a REST API"""
-        return self._check_model(model, self._user_model_types, 'user')
-        for groupname in model.get('groups', []):
-            if not isinstance(groupname, str):
-                raise web.HTTPError(400, "group names must be str, not %r" % type(groupname))
-
-    def _check_group_model(self, model):
-        """Check a request-provided user model from a REST API"""
-        self._check_model(model, self._group_model_types, 'group')
+        self._check_model(model, self._user_model_types, 'user')
         for username in model.get('users', []):
             if not isinstance(username, str):
-                raise web.HTTPError(400, "usernames must be str, not %r" % type(groupname))
+                raise web.HTTPError(400, ("usernames must be str, not %r", type(username)))
+
+    def _check_group_model(self, model):
+        """Check a request-provided group model from a REST API"""
+        self._check_model(model, self._group_model_types, 'group')
+        for groupname in model.get('groups', []):
+            if not isinstance(groupname, str):
+                raise web.HTTPError(400, ("group names must be str, not %r", type(groupname)))
+
 
     def options(self, *args, **kwargs):
         self.set_header('Access-Control-Allow-Headers', 'accept, content-type')
         self.finish()
-    

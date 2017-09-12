@@ -9,13 +9,20 @@ Module: :mod:`jupyterhub.auth`
 
 .. currentmodule:: jupyterhub.auth
 
+:class:`Authenticator`
+----------------------
 
-
-.. autoclass:: Authenticator
+.. autoconfigurable:: Authenticator
     :members:
 
-.. autoclass:: LocalAuthenticator
+:class:`LocalAuthenticator`
+---------------------------
+
+.. autoconfigurable:: LocalAuthenticator
     :members:
 
-.. autoclass:: PAMAuthenticator
+:class:`PAMAuthenticator`
+-------------------------
+
+.. autoconfigurable:: PAMAuthenticator
 

@@ -7,6 +7,7 @@ from http.client import responses
 
 from jinja2 import TemplateNotFound
 from tornado import web, gen
+from tornado.httputil import url_concat
 
 from .. import orm
 from ..utils import admin_only, url_path_join
@@ -28,15 +29,15 @@ class RootHandler(BaseHandler):
     """
     def get(self):
         next_url = self.get_argument('next', '')
-        if not next_url.startswith('/'):
-            self.log.warn("Disallowing redirect outside JupyterHub: %r", next_url)
+        if next_url and not next_url.startswith('/'):
+            self.log.warning("Disallowing redirect outside JupyterHub: %r", next_url)
             next_url = ''
         if next_url and next_url.startswith(url_path_join(self.base_url, 'user/')):
             # add /hub/ prefix, to ensure we redirect to the right user's server.
             # The next request will be handled by UserSpawnHandler,
             # ultimately redirecting to the logged-in user's server.
             without_prefix = next_url[len(self.base_url):]
-            next_url = url_path_join(self.hub.server.base_url, without_prefix)
+            next_url = url_path_join(self.hub.base_url, without_prefix)
             self.log.warning("Redirecting %s to %s. For sharing public links, use /user-redirect/",
                 self.request.uri, next_url,
             )
@@ -49,10 +50,10 @@ class RootHandler(BaseHandler):
                 self.log.debug("User is running: %s", url)
                 self.set_login_cookie(user) # set cookie
             else:
-                url = url_path_join(self.hub.server.base_url, 'home')
+                url = url_path_join(self.hub.base_url, 'home')
                 self.log.debug("User is not running: %s", url)
         else:
-            url = self.authenticator.login_url(self.base_url)
+            url = self.settings['login_url']
         self.redirect(url)
 
 
@@ -66,8 +67,13 @@ class HomeHandler(BaseHandler):
         if user.running:
             # trigger poll_and_notify event in case of a server that died
             yield user.spawner.poll_and_notify()
+        # send the user to /spawn if they aren't running,
+        # to establish that this is an explicit spawn request rather
+        # than an implicit one, which can be caused by any link to `/user/:name`
+        url = user.url if user.running else url_path_join(self.hub.base_url, 'spawn')
         html = self.render_template('home.html',
             user=user,
+            url=url,
         )
         self.finish(html)
 
@@ -85,13 +91,17 @@ class SpawnHandler(BaseHandler):
             user=user,
             spawner_options_form=user.spawner.options_form,
             error_message=message,
+            url=self.request.uri,
         )
 
     @web.authenticated
     def get(self):
-        """GET renders form for spawning with user-specified options"""
+        """GET renders form for spawning with user-specified options
+
+        or triggers spawn via redirect if there is no form.
+        """
         user = self.get_current_user()
-        if user.running:
+        if not self.allow_named_servers and user.running:
             url = user.url
             self.log.debug("User is running: %s", url)
             self.redirect(url)
@@ -99,7 +109,12 @@ class SpawnHandler(BaseHandler):
         if user.spawner.options_form:
             self.finish(self._render_form())
         else:
-            # not running, no form. Trigger spawn.
+            # Explicit spawn request: clear _spawn_future
+            # which may have been saved to prevent implicit spawns
+            # after a failure.
+            if user.spawner._spawn_future and user.spawner._spawn_future.done():
+                user.spawner._spawn_future = None
+            # not running, no form. Trigger spawn by redirecting to /user/:name
             self.redirect(user.url)
 
     @web.authenticated
@@ -107,11 +122,15 @@ class SpawnHandler(BaseHandler):
     def post(self):
         """POST spawns with user-specified options"""
         user = self.get_current_user()
-        if user.running:
+        if not self.allow_named_servers and user.running:
             url = user.url
             self.log.warning("User is already running: %s", url)
             self.redirect(url)
             return
+        if user.spawner.pending:
+            raise web.HTTPError(
+                400, "%s is pending %s" % (user.spawner._log_name, user.spawner.pending)
+            )
         form_options = {}
         for key, byte_list in self.request.body_arguments.items():
             form_options[key] = [ bs.decode('utf8') for bs in byte_list ]
@@ -126,6 +145,13 @@ class SpawnHandler(BaseHandler):
             return
         self.set_login_cookie(user)
         url = user.url
+
+        next_url = self.get_argument('next', '')
+        if next_url and not next_url.startswith('/'):
+            self.log.warning("Disallowing redirect outside JupyterHub: %r", next_url)
+        elif next_url:
+            url = next_url
+
         self.redirect(url)
 
 class AdminHandler(BaseHandler):
@@ -136,14 +162,19 @@ class AdminHandler(BaseHandler):
         available = {'name', 'admin', 'running', 'last_activity'}
         default_sort = ['admin', 'name']
         mapping = {
-            'running': '_server_id'
+            'running': orm.Spawner.server_id,
         }
+        for name in available:
+            if name not in mapping:
+                mapping[name] = getattr(orm.User, name)
+
         default_order = {
             'name': 'asc',
             'last_activity': 'desc',
             'admin': 'desc',
             'running': 'desc',
         }
+
         sorts = self.get_arguments('sort') or default_sort
         orders = self.get_arguments('order')
 
@@ -166,11 +197,11 @@ class AdminHandler(BaseHandler):
 
         # this could be one incomprehensible nested list comprehension
         # get User columns
-        cols = [ getattr(orm.User, mapping.get(c, c)) for c in sorts ]
+        cols = [ mapping[c] for c in sorts ]
         # get User.col.desc() order objects
         ordered = [ getattr(c, o)() for c, o in zip(cols, orders) ]
 
-        users = self.db.query(orm.User).order_by(*ordered)
+        users = self.db.query(orm.User).join(orm.Spawner).order_by(*ordered)
         users = [ self._user_from_orm(u) for u in users ]
         running = [ u for u in users if u.running ]
 
@@ -184,6 +215,15 @@ class AdminHandler(BaseHandler):
         self.finish(html)
 
 
+class TokenPageHandler(BaseHandler):
+    """Handler for page requesting new API tokens"""
+
+    @web.authenticated
+    def get(self):
+        html = self.render_template('token.html')
+        self.finish(html)
+
+
 class ProxyErrorHandler(BaseHandler):
     """Handler for rendering proxy error pages"""
     
@@ -192,7 +232,7 @@ class ProxyErrorHandler(BaseHandler):
         status_message = responses.get(status_code, 'Unknown HTTP Error')
         # build template namespace
         
-        hub_home = url_path_join(self.hub.server.base_url, 'home')
+        hub_home = url_path_join(self.hub.base_url, 'home')
         message_html = ''
         if status_code == 503:
             message_html = ' '.join([
@@ -218,9 +258,10 @@ class ProxyErrorHandler(BaseHandler):
 
 
 default_handlers = [
-    (r'/', RootHandler),
+    (r'/?', RootHandler),
     (r'/home', HomeHandler),
     (r'/admin', AdminHandler),
     (r'/spawn', SpawnHandler),
+    (r'/token', TokenPageHandler),
     (r'/error/(\d+)', ProxyErrorHandler),
 ]

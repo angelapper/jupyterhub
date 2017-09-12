@@ -4,10 +4,8 @@ import os
 import sys
 from tempfile import NamedTemporaryFile
 import threading
-
 from unittest import mock
-
-import requests
+from urllib.parse import urlparse
 
 from tornado import gen
 from tornado.concurrent import Future
@@ -18,9 +16,11 @@ from traitlets import default
 from ..app import JupyterHub
 from ..auth import PAMAuthenticator
 from .. import orm
+from ..objects import Server
 from ..spawner import LocalProcessSpawner
 from ..singleuser import SingleUserNotebookApp
-from ..utils import random_port
+from ..utils import random_port, url_path_join
+from .utils import async_requests
 
 from pamela import PAMError
 
@@ -56,32 +56,68 @@ class MockSpawner(LocalProcessSpawner):
     def _cmd_default(self):
         return [sys.executable, '-m', 'jupyterhub.tests.mocksu']
 
+    use_this_api_token = None
+    def start(self):
+        if self.use_this_api_token:
+            self.api_token = self.use_this_api_token
+        elif self.will_resume:
+            self.use_this_api_token = self.api_token
+        return super().start()
 
 class SlowSpawner(MockSpawner):
     """A spawner that takes a few seconds to start"""
-    
+
+    delay = 2
+    _start_future = None
     @gen.coroutine
     def start(self):
         (ip, port) = yield super().start()
-        yield gen.sleep(2)
+        if self._start_future is not None:
+            yield self._start_future
+        else:
+            yield gen.sleep(self.delay)
         return ip, port
-    
+
     @gen.coroutine
     def stop(self):
-        yield gen.sleep(2)
+        yield gen.sleep(self.delay)
         yield super().stop()
 
 
 class NeverSpawner(MockSpawner):
     """A spawner that will never start"""
-    
+
     @default('start_timeout')
     def _start_timeout_default(self):
         return 1
-    
+
     def start(self):
         """Return a Future that will never finish"""
         return Future()
+
+    @gen.coroutine
+    def stop(self):
+        pass
+
+    @gen.coroutine
+    def poll(self):
+        return 0
+
+
+class BadSpawner(MockSpawner):
+    """Spawner that fails immediately"""
+    def start(self):
+        raise RuntimeError("I don't work!")
+
+
+class SlowBadSpawner(MockSpawner):
+    """Spawner that fails after a short delay"""
+
+    @gen.coroutine
+    def start(self):
+        yield gen.sleep(0.1)
+        raise RuntimeError("I don't work!")
+
 
 
 class FormSpawner(MockSpawner):
@@ -101,6 +137,7 @@ class FormSpawner(MockSpawner):
 
 
 class MockPAMAuthenticator(PAMAuthenticator):
+    auth_state = None
     @default('admin_users')
     def _admin_users_default(self):
         return {'admin'}
@@ -109,24 +146,35 @@ class MockPAMAuthenticator(PAMAuthenticator):
         # skip the add-system-user bit
         return not user.name.startswith('dne')
     
+    @gen.coroutine
     def authenticate(self, *args, **kwargs):
         with mock.patch.multiple('pamela',
                 authenticate=mock_authenticate,
                 open_session=mock_open_session,
                 close_session=mock_open_session,
                 ):
-            return super(MockPAMAuthenticator, self).authenticate(*args, **kwargs)
+            username = yield super(MockPAMAuthenticator, self).authenticate(*args, **kwargs)
+        if username is None:
+            return
+        if self.auth_state:
+            return {
+                'name': username,
+                'auth_state': self.auth_state,
+            }
+        else:
+            return username
 
 
 class MockHub(JupyterHub):
     """Hub with various mock bits"""
 
     db_file = None
-    confirm_no_ssl = True
     
     last_activity_interval = 2
     
     base_url = '/@/space%20word/'
+    
+    log_datefmt = '%M:%S'
     
     @default('subdomain_host')
     def _subdomain_host_default(self):
@@ -135,7 +183,15 @@ class MockHub(JupyterHub):
     @default('ip')
     def _ip_default(self):
         return '127.0.0.1'
-    
+
+    @default('port')
+    def _port_default(self):
+        if self.subdomain_host:
+            port = urlparse(self.subdomain_host).port
+            if port:
+                return port
+        return random_port()
+
     @default('authenticator_class')
     def _authenticator_class_default(self):
         return MockPAMAuthenticator
@@ -146,50 +202,36 @@ class MockHub(JupyterHub):
     
     def init_signal(self):
         pass
-    
-    def start(self, argv=None):
-        self.db_file = NamedTemporaryFile()
+
+    def load_config_file(self, *args, **kwargs):
+        pass
+
+    @gen.coroutine
+    def initialize(self, argv=None):
         self.pid_file = NamedTemporaryFile(delete=False).name
-        self.db_url = self.db_file.name
-        
-        evt = threading.Event()
-        
-        @gen.coroutine
-        def _start_co():
-            assert self.io_loop._running
-            # put initialize in start for SQLAlchemy threading reasons
-            yield super(MockHub, self).initialize(argv=argv)
-            # add an initial user
+        self.db_file = NamedTemporaryFile()
+        self.db_url = os.getenv('JUPYTERHUB_TEST_DB_URL') or self.db_file.name
+        yield super().initialize([])
+
+        # add an initial user
+        user = self.db.query(orm.User).filter(orm.User.name == 'user').first()
+        if user is None:
             user = orm.User(name='user')
             self.db.add(user)
             self.db.commit()
-            yield super(MockHub, self).start()
-            yield self.hub.server.wait_up(http=True)
-            self.io_loop.add_callback(evt.set)
-        
-        def _start():
-            self.io_loop = IOLoop()
-            self.io_loop.make_current()
-            self.io_loop.add_callback(_start_co)
-            self.io_loop.start()
-        
-        self._thread = threading.Thread(target=_start)
-        self._thread.start()
-        ready = evt.wait(timeout=10)
-        assert ready
-    
+
     def stop(self):
         super().stop()
-        self._thread.join()
         IOLoop().run_sync(self.cleanup)
         # ignore the call that will fire in atexit
         self.cleanup = lambda : None
         self.db_file.close()
     
+    @gen.coroutine
     def login_user(self, name):
         """Login a user by name, returning her cookies."""
         base_url = public_url(self)
-        r = requests.post(base_url + 'hub/login',
+        r = yield async_requests.post(base_url + 'hub/login',
             data={
                 'username': name,
                 'password': name,
@@ -206,19 +248,24 @@ def public_host(app):
     if app.subdomain_host:
         return app.subdomain_host
     else:
-        return app.proxy.public_server.host
+        return Server.from_url(app.proxy.public_url).host
 
 
-def public_url(app, user_or_service=None):
+def public_url(app, user_or_service=None, path=''):
     """Return the full, public base URL (including prefix) of the given JupyterHub instance."""
     if user_or_service:
         if app.subdomain_host:
             host = user_or_service.host
         else:
             host = public_host(app)
-        return host + user_or_service.server.base_url
+        prefix = user_or_service.prefix
     else:
-        return public_host(app) + app.proxy.public_server.base_url
+        host = public_host(app)
+        prefix = Server.from_url(app.proxy.public_url).base_url
+    if path:
+        return host + url_path_join(prefix, path)
+    else:
+        return host + prefix
 
 
 # single-user-server mocking:
@@ -235,12 +282,13 @@ class MockSingleUserServer(SingleUserNotebookApp):
         pass
 
 
-class TestSingleUserSpawner(MockSpawner):
+class StubSingleUserSpawner(MockSpawner):
     """Spawner that starts a MockSingleUserServer in a thread."""
     _thread = None
     @gen.coroutine
     def start(self):
-        self.user.server.port = random_port()
+        ip = self.ip = '127.0.0.1'
+        port = self.port = random_port()
         env = self.get_env()
         args = self.get_args()
         evt = threading.Event()
@@ -253,12 +301,15 @@ class TestSingleUserSpawner(MockSpawner):
             with mock.patch.dict(os.environ, env):
                 app = self._app = MockSingleUserServer()
                 app.initialize(args)
+                assert app.hub_auth.oauth_client_id
+                assert app.hub_auth.api_token
                 app.start()
         
         self._thread = threading.Thread(target=_run)
         self._thread.start()
         ready = evt.wait(timeout=3)
         assert ready
+        return (ip, port)
     
     @gen.coroutine
     def stop(self):

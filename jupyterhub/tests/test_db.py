@@ -1,7 +1,8 @@
+from glob import glob
 import os
 import shutil
 
-from sqlalchemy.exc import OperationalError
+import pytest
 from pytest import raises
 
 from ..dbutil import upgrade
@@ -23,18 +24,26 @@ def test_upgrade(tmpdir):
     print(db_url)
     upgrade(db_url)
 
-def test_upgrade_entrypoint(tmpdir, io_loop):
+@pytest.mark.gen_test
+def test_upgrade_entrypoint(tmpdir):
     generate_old_db(str(tmpdir))
     tmpdir.chdir()
     tokenapp = NewToken()
     tokenapp.initialize(['kaylee'])
-    with raises(OperationalError):
+    with raises(SystemExit):
         tokenapp.start()
-    
+
+    sqlite_files = glob(os.path.join(str(tmpdir), 'jupyterhub.sqlite*'))
+    assert len(sqlite_files) == 1
+
     upgradeapp = UpgradeDB()
-    io_loop.run_sync(lambda : upgradeapp.initialize([]))
+    yield upgradeapp.initialize([])
     upgradeapp.start()
-    
+
+    # check that backup was created:
+    sqlite_files = glob(os.path.join(str(tmpdir), 'jupyterhub.sqlite*'))
+    assert len(sqlite_files) == 2
+
     # run tokenapp again, it should work
     tokenapp.start()
     

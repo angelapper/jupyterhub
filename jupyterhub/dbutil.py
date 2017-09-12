@@ -18,10 +18,10 @@ ALEMBIC_DIR = os.path.join(_here, 'alembic')
 
 def write_alembic_ini(alembic_ini='alembic.ini', db_url='sqlite:///jupyterhub.sqlite'):
     """Write a complete alembic.ini from our template.
-    
+
     Parameters
     ----------
-    
+
     alembic_ini: str
         path to the alembic.ini file that should be written.
     db_url: str
@@ -29,34 +29,37 @@ def write_alembic_ini(alembic_ini='alembic.ini', db_url='sqlite:///jupyterhub.sq
     """
     with open(ALEMBIC_INI_TEMPLATE_PATH) as f:
         alembic_ini_tpl = f.read()
-    
+
     with open(alembic_ini, 'w') as f:
         f.write(
             alembic_ini_tpl.format(
                 alembic_dir=ALEMBIC_DIR,
-                db_url=db_url,
+                # If there are any %s in the URL, they should be replaced with %%, since ConfigParser
+                # by default uses %() for substitution. You'll get %s in your URL when you have usernames
+                # with special chars (such as '@') that need to be URL encoded. URL Encoding is done with %s.
+                # YAY for nested templates?
+                db_url=str(db_url).replace('%', '%%'),
             )
         )
-    
 
 
 @contextmanager
 def _temp_alembic_ini(db_url):
     """Context manager for temporary JupyterHub alembic directory
-    
+
     Temporarily write an alembic.ini file for use with alembic migration scripts.
-    
+
     Context manager yields alembic.ini path.
-    
+
     Parameters
     ----------
-    
+
     db_url: str
         The SQLAlchemy database url, e.g. `sqlite:///jupyterhub.sqlite`.
-    
+
     Returns
     -------
-    
+
     alembic_ini: str
         The path to the temporary alembic.ini that we have created.
         This file will be cleaned up on exit from the context manager.
@@ -69,7 +72,7 @@ def _temp_alembic_ini(db_url):
 
 def upgrade(db_url, revision='head'):
     """Upgrade the given database to revision.
-    
+
     db_url: str
         The SQLAlchemy database url, e.g. `sqlite:///jupyterhub.sqlite`.
     revision: str [default: head]
@@ -80,6 +83,7 @@ def upgrade(db_url, revision='head'):
             ['alembic', '-c', alembic_ini, 'upgrade', revision]
         )
 
+
 def _alembic(*args):
     """Run an alembic command with a temporary alembic.ini"""
     with _temp_alembic_ini('sqlite:///jupyterhub.sqlite') as alembic_ini:
@@ -89,5 +93,4 @@ def _alembic(*args):
 
 
 if __name__ == '__main__':
-    import sys
     _alembic(*sys.argv[1:])

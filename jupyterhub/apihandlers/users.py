@@ -12,6 +12,22 @@ from ..utils import admin_only
 from .base import APIHandler
 
 
+class SelfAPIHandler(APIHandler):
+    """Return the authenticated user's model
+    
+    Based on the authentication info. Acts as a 'whoami' for auth tokens.
+    """
+    @web.authenticated
+    def get(self):
+        user = self.get_current_user()
+        if user is None:
+            # whoami can be accessed via oauth token
+            user = self.get_current_user_oauth_token()
+        if user is None:
+            raise web.HTTPError(403)
+        self.write(json.dumps(self.user_model(user)))
+
+
 class UserListAPIHandler(APIHandler):
     @admin_only
     def get(self):
@@ -76,7 +92,7 @@ class UserListAPIHandler(APIHandler):
 
 def admin_or_self(method):
     """Decorator for restricting access to either the target user or admin"""
-    def m(self, name):
+    def m(self, name, *args, **kwargs):
         current = self.get_current_user()
         if current is None:
             raise web.HTTPError(403)
@@ -86,7 +102,7 @@ def admin_or_self(method):
         # raise 404 if not found
         if not self.find_user(name):
             raise web.HTTPError(404)
-        return method(self, name)
+        return method(self, name, *args, **kwargs)
     return m
 
 class UserAPIHandler(APIHandler):
@@ -130,19 +146,19 @@ class UserAPIHandler(APIHandler):
             raise web.HTTPError(404)
         if user.name == self.get_current_user().name:
             raise web.HTTPError(400, "Cannot delete yourself!")
-        if user.stop_pending:
+        if user.spawner._stop_pending:
             raise web.HTTPError(400, "%s's server is in the process of stopping, please wait." % name)
         if user.running:
             yield self.stop_single_user(user)
-            if user.stop_pending:
+            if user.spawner._stop_pending:
                 raise web.HTTPError(400, "%s's server is in the process of stopping, please wait." % name)
         
         yield gen.maybe_future(self.authenticator.delete_user(user))
         # remove from registry
         del self.users[user]
-        
+
         self.set_status(204)
-    
+
     @admin_only
     def patch(self, name):
         user = self.find_user(name)
@@ -150,6 +166,10 @@ class UserAPIHandler(APIHandler):
             raise web.HTTPError(404)
         data = self.get_json_body()
         self._check_user_model(data)
+        if 'name' in data and data['name'] != name:
+            # check if the new name is already taken inside db
+            if self.find_user(data['name']):
+                raise web.HTTPError(400, "User %s already exists, username must be unique" % data['name'])
         for key, value in data.items():
             setattr(user, key, value)
         self.db.commit()
@@ -157,37 +177,73 @@ class UserAPIHandler(APIHandler):
 
 
 class UserServerAPIHandler(APIHandler):
-    @gen.coroutine
-    @admin_or_self
-    def post(self, name):
-        user = self.find_user(name)
-        if user.running:
-            # include notify, so that a server that died is noticed immediately
-            state = yield user.spawner.poll_and_notify()
-            if state is None:
-                raise web.HTTPError(400, "%s's server is already running" % name)
-
-        options = self.get_json_body()
-        yield self.spawn_single_user(user, options=options)
-        status = 202 if user.spawn_pending else 201
-        self.set_status(status)
+    """Start and stop single-user servers"""
 
     @gen.coroutine
     @admin_or_self
-    def delete(self, name):
+    def post(self, name, server_name=''):
         user = self.find_user(name)
-        if user.stop_pending:
+        if server_name and not self.allow_named_servers:
+            raise web.HTTPError(400, "Named servers are not enabled.")
+        if self.allow_named_servers and not server_name:
+            server_name = user.default_server_name()
+        spawner = user.spawners[server_name]
+        pending = spawner.pending
+        if pending == 'spawn':
+            self.set_header('Content-Type', 'text/plain')
             self.set_status(202)
             return
-        if not user.running:
-            raise web.HTTPError(400, "%s's server is not running" % name)
-        # include notify, so that a server that died is noticed immediately
-        status = yield user.spawner.poll_and_notify()
-        if status is not None:
-            raise web.HTTPError(400, "%s's server is not running" % name)
-        yield self.stop_single_user(user)
-        status = 202 if user.stop_pending else 204
+        elif pending:
+            raise web.HTTPError(400, "%s is pending %s" % (spawner._log_name, pending))
+
+        if spawner.ready:
+            # include notify, so that a server that died is noticed immediately
+            # set _spawn_pending flag to prevent races while we wait
+            spawner._spawn_pending = True
+            try:
+                state = yield spawner.poll_and_notify()
+            finally:
+                spawner._spawn_pending = False
+            if state is None:
+                raise web.HTTPError(400, "%s is already running" % spawner._log_name)
+
+        options = self.get_json_body()
+        yield self.spawn_single_user(user, server_name, options=options)
+        status = 202 if spawner.pending == 'spawn' else 201
+        self.set_header('Content-Type', 'text/plain')
         self.set_status(status)
+
+    @gen.coroutine
+    @admin_or_self
+    def delete(self, name, server_name=''):
+        user = self.find_user(name)
+        if server_name:
+            if not self.allow_named_servers:
+                raise web.HTTPError(400, "Named servers are not enabled.")
+            if server_name not in user.spawners:
+                raise web.HTTPError(404, "%s has no server named '%s'" % (name, server_name))
+
+        spawner = user.spawners[server_name]
+        if spawner.pending == 'stop':
+            self.log.debug("%s already stopping", spawner._log_name)
+            self.set_header('Content-Type', 'text/plain')
+            self.set_status(202)
+            return
+
+        if not spawner.ready:
+            raise web.HTTPError(
+                400, "%s is not running %s" %
+                (spawner._log_name, '(pending: %s)' % spawner.pending if spawner.pending else '')
+            )
+        # include notify, so that a server that died is noticed immediately
+        status = yield spawner.poll_and_notify()
+        if status is not None:
+            raise web.HTTPError(400, "%s is not running" % spawner._log_name)
+        yield self.stop_single_user(user, server_name)
+        status = 202 if spawner._stop_pending else 204
+        self.set_header('Content-Type', 'text/plain')
+        self.set_status(status)
+
 
 class UserAdminAccessAPIHandler(APIHandler):
     """Grant admins access to single-user servers
@@ -196,6 +252,8 @@ class UserAdminAccessAPIHandler(APIHandler):
     """
     @admin_only
     def post(self, name):
+        self.log.warning("Deprecated in JupyterHub 0.8."
+            " Admin access API is not needed now that we use OAuth.")
         current = self.get_current_user()
         self.log.warning("Admin user %s has requested access to %s's server",
             current.name, name,
@@ -205,15 +263,13 @@ class UserAdminAccessAPIHandler(APIHandler):
         user = self.find_user(name)
         if user is None:
             raise web.HTTPError(404)
-        if not user.running:
-            raise web.HTTPError(400, "%s's server is not running" % name)
-        self.set_server_cookie(user)
-        current.other_user_cookies.add(name)
 
 
 default_handlers = [
+    (r"/api/user", SelfAPIHandler),
     (r"/api/users", UserListAPIHandler),
     (r"/api/users/([^/]+)", UserAPIHandler),
     (r"/api/users/([^/]+)/server", UserServerAPIHandler),
+    (r"/api/users/([^/]+)/servers/([^/]*)", UserServerAPIHandler),
     (r"/api/users/([^/]+)/admin-access", UserAdminAccessAPIHandler),
 ]

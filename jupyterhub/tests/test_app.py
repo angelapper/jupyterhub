@@ -12,6 +12,7 @@ import pytest
 
 from .mocking import MockHub
 from .. import orm
+from ..app import COOKIE_SECRET_BYTES
 
 def test_help_all():
     out = check_output([sys.executable, '-m', 'jupyterhub', '--help-all']).decode('utf8', 'replace')
@@ -55,7 +56,9 @@ def test_generate_config():
     assert 'Spawner.cmd' in cfg_text
     assert 'Authenticator.whitelist' in cfg_text
 
-def test_init_tokens(io_loop):
+
+@pytest.mark.gen_test
+def test_init_tokens():
     with TemporaryDirectory() as td:
         db_file = os.path.join(td, 'jupyterhub.sqlite')
         tokens = {
@@ -64,29 +67,29 @@ def test_init_tokens(io_loop):
             'boagasdfasdf': 'chell',
         }
         app = MockHub(db_url=db_file, api_tokens=tokens)
-        io_loop.run_sync(lambda : app.initialize([]))
+        yield app.initialize([])
         db = app.db
         for token, username in tokens.items():
             api_token = orm.APIToken.find(db, token)
             assert api_token is not None
             user = api_token.user
             assert user.name == username
-        
+
         # simulate second startup, reloading same tokens:
         app = MockHub(db_url=db_file, api_tokens=tokens)
-        io_loop.run_sync(lambda : app.initialize([]))
+        yield app.initialize([])
         db = app.db
         for token, username in tokens.items():
             api_token = orm.APIToken.find(db, token)
             assert api_token is not None
             user = api_token.user
             assert user.name == username
-        
+
         # don't allow failed token insertion to create users:
         tokens['short'] = 'gman'
         app = MockHub(db_url=db_file, api_tokens=tokens)
         with pytest.raises(ValueError):
-            io_loop.run_sync(lambda : app.initialize([]))
+            yield app.initialize([])
         assert orm.User.find(app.db, 'gman') is None
 
 
@@ -102,8 +105,8 @@ def test_write_cookie_secret(tmpdir):
 def test_cookie_secret_permissions(tmpdir):
     secret_file = tmpdir.join('cookie_secret')
     secret_path = str(secret_file)
-    secret = os.urandom(1024)
-    secret_file.write(binascii.b2a_base64(secret))
+    secret = os.urandom(COOKIE_SECRET_BYTES)
+    secret_file.write(binascii.b2a_hex(secret))
     hub = MockHub(cookie_secret_file=secret_path)
 
     # raise with public secret file
@@ -140,15 +143,16 @@ def test_cookie_secret_env(tmpdir):
     assert not os.path.exists(hub.cookie_secret_file)
 
 
-def test_load_groups(io_loop):
+@pytest.mark.gen_test
+def test_load_groups():
     to_load = {
         'blue': ['cyclops', 'rogue', 'wolverine'],
         'gold': ['storm', 'jean-grey', 'colossus'],
     }
     hub = MockHub(load_groups=to_load)
     hub.init_db()
-    io_loop.run_sync(hub.init_users)
-    hub.init_groups()
+    yield hub.init_users()
+    yield hub.init_groups()
     db = hub.db
     blue = orm.Group.find(db, name='blue')
     assert blue is not None
@@ -156,3 +160,4 @@ def test_load_groups(io_loop):
     gold = orm.Group.find(db, name='gold')
     assert gold is not None
     assert sorted([ u.name for u in gold.users ]) == sorted(to_load['gold'])
+
